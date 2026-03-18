@@ -1,0 +1,183 @@
+import requests
+import re
+import csv
+from datetime import datetime, timedelta
+from collections import defaultdict
+import math
+import time
+import matplotlib.pyplot as plt
+
+# --- INTERACTIVE CONFIGURATION ---
+GITHUB_TOKEN = input("Enter your GITHUB_TOKEN: ").strip()
+REPO_OWNER = input("Enter the REPO_OWNER (e.g., liferay-appsec): ").strip()
+REPO_NAME = "liferay-portal"
+
+print("\n--- Analysis Mode ---")
+print("[1] Team Analysis (Monthly Stats)")
+print("[2] Analysis per Engineer (Stats by Username)")
+ANALYSIS_MODE = input("Choose mode [1/2]: ").strip()
+
+def get_dates():
+    print("\n--- Date Range Setup ---")
+    now = datetime.now() # Fixed: Now dynamically uses today's date
+
+    start_str = input("Start Date (YYYY-MM-DD): ").strip()
+    end_str = input("End Date (YYYY-MM-DD) [Default Today]: ").strip()
+
+    try:
+        start = datetime.strptime(start_str, "%Y-%m-%d")
+        end = datetime.strptime(end_str, "%Y-%m-%d") if end_str else now
+        return start, end
+    except ValueError:
+        print("Invalid format! Defaulting to past 60 days.")
+        return now - timedelta(days=60), now
+
+START_DATE, END_DATE = get_dates()
+
+def extract_ticket(title):
+    if not title: return "NO-TICKET"
+    match = re.search(r"([A-Za-z]{3,5})[\s\-]?(\d+)", title)
+    if match:
+        return f"{match.group(1).upper()}-{match.group(2)}"
+    return "NO-TICKET"
+
+def get_85th_percentile(data):
+    if not data: return 0
+    sorted_data = sorted(data)
+    index = math.ceil(len(sorted_data) * 0.85) - 1
+    return sorted_data[index]
+
+def fetch_prs(states):
+    url = "https://api.github.com/graphql"
+    headers = {"Authorization": f"Bearer {GITHUB_TOKEN}"}
+
+    query = """
+    query($owner: String!, $name: String!, $states: [PullRequestState!]!, $cursor: String) {
+      repository(owner: $owner, name: $name) {
+        pullRequests(states: $states, first: 100, after: $cursor, orderBy: {field: CREATED_AT, direction: DESC}) {
+          pageInfo { hasNextPage, endCursor }
+          nodes {
+            number, title, createdAt, closedAt, isDraft, author { login }
+          }
+        }
+      }
+    }
+    """
+    all_prs = []
+    cursor = None
+    print(f"--- Fetching {states} PRs... ---")
+
+    while True:
+        variables = {"owner": REPO_OWNER, "name": REPO_NAME, "states": states, "cursor": cursor}
+        response = requests.post(url, json={'query': query, 'variables': variables}, headers=headers)
+
+        # FIX: Added robust error handling
+        if response.status_code != 200:
+            print(f"Error: GitHub API returned {response.status_code} - {response.text}")
+            break
+
+        res_data = response.json().get('data', {}).get('repository', {}).get('pullRequests', {})
+        nodes = res_data.get('nodes', [])
+        if not nodes: break
+
+        filtered = [n for n in nodes if n['isDraft'] is False]
+        all_prs.extend(filtered)
+
+        last_date_str = nodes[-1]['createdAt']
+        last_date = datetime.fromisoformat(last_date_str.replace('Z', '+00:00')).replace(tzinfo=None)
+
+        if states != ["OPEN"] and last_date < START_DATE:
+            break
+
+        # FIX: Safer pagination checks
+        page_info = res_data.get('pageInfo', {})
+        if not page_info.get('hasNextPage'): break
+        cursor = page_info.get('endCursor')
+        time.sleep(0.1)
+
+    return all_prs
+
+def run_full_analysis():
+    closed_raw = fetch_prs(["CLOSED", "MERGED"])
+    open_raw = fetch_prs(["OPEN"])
+
+    stats = defaultdict(list)
+    tickets = defaultdict(lambda: defaultdict(int))
+    max_details = defaultdict(lambda: (0.0, "N/A"))
+    all_lts = []
+    global_ticket_counts = defaultdict(int)
+
+    period_closed_prs = []
+    for pr in closed_raw:
+        closed_at = datetime.fromisoformat(pr['closedAt'].replace('Z', '+00:00')).replace(tzinfo=None)
+        if START_DATE <= closed_at <= END_DATE:
+            period_closed_prs.append(pr)
+            created_at = datetime.fromisoformat(pr['createdAt'].replace('Z', '+00:00')).replace(tzinfo=None)
+            lt = (closed_at - created_at).total_seconds() / 86400
+            ticket = extract_ticket(pr['title'])
+            author = pr['author']['login'] if pr['author'] else "unknown"
+            key = author if ANALYSIS_MODE == "2" else closed_at.strftime("%Y-%m")
+
+            stats[key].append(lt)
+            tickets[key][ticket] += 1
+            all_lts.append(lt)
+            if ticket != "NO-TICKET": global_ticket_counts[ticket] += 1
+            if lt > max_details[key][0]: max_details[key] = (lt, ticket)
+
+    # --- AGGREGATE SUMMARY DASHBOARD ---
+    avg_lt_total = sum(all_lts) / len(all_lts) if all_lts else 0
+    valid_ticket_list = list(global_ticket_counts.values())
+    avg_ping_total = sum(valid_ticket_list) / len(valid_ticket_list) if valid_ticket_list else 1
+    months_diff = max((END_DATE - START_DATE).days / 30, 1)
+
+    print("\n" + "="*70)
+    print(f"📊 SUMMARY DASHBOARD: {REPO_OWNER}/{REPO_NAME}")
+    print(f"📅 Interval: {START_DATE.date()} to {END_DATE.date()}")
+    print("-" * 70)
+    print(f"🔹 Avg PRs closed /month:      {len(all_lts) / months_diff:.2f}")
+    print(f"🔹 Average Lead Time:          {avg_lt_total:.2f} days")
+    print(f"🔹 P85 Lead Time:              {get_85th_percentile(all_lts):.2f} days")
+    print(f"🔹 Average Ping-Pong Ratio:    {avg_ping_total:.2f} PRs/ticket")
+    print(f"🔹 Total Ticket Review:        {avg_lt_total * avg_ping_total:.2f} days")
+    print("="*70)
+
+    # --- TABLES ---
+    label = "Engineer" if ANALYSIS_MODE == "2" else "Month"
+    print(f"\nTABLE 1: ANALYSIS PER {label.upper()}")
+    header1 = f"| {label:<15} | {'PRs':<5} | {'Avg LT':<8} | {'P85 LT':<8} | {'Avg Ping':<8} | {'Max LT':<8} | {'Max Ticket':<12} |"
+    print(header1 + "\n" + "-"*len(header1))
+    for k in sorted(stats.keys(), key=lambda x: (len(stats[x]) if ANALYSIS_MODE == "2" else x), reverse=True):
+        data = stats[k]
+        t_vals = list(tickets[k].values())
+        avg_ping = sum(t_vals) / len(t_vals) if t_vals else 1
+        print(f"| {k:<15} | {len(data):<5} | {sum(data)/len(data):<8.2f} | {get_85th_percentile(data):<8.2f} | {avg_ping:<8.2f} | {max_details[k][0]:<8.2f} | {max_details[k][1]:<12} |")
+
+    print(f"\nTABLE 2: CURRENTLY OPEN (NON-DRAFT)")
+    header2 = f"| {'Ticket ID':<15} | {'Days in Review':<15} |"
+    print(header2 + "\n" + "-"*len(header2))
+    open_ages = []
+
+    current_time = datetime.now() # FIX: Added to calculate accurate age for open PRs
+
+    for pr in open_raw:
+        created = datetime.fromisoformat(pr['createdAt'].replace('Z', '+00:00')).replace(tzinfo=None)
+        # FIX: Now uses current_time instead of END_DATE
+        age = (current_time - created).total_seconds() / 86400
+        open_ages.append(age)
+        if len(open_ages) <= 15:
+            print(f"| {extract_ticket(pr['title']):<15} | {age:<15.2f} |")
+
+    # --- HISTOGRAM WITH INTEGER THRESHOLDS ---
+    print("\n")
+    plt.figure(figsize=(10, 5))
+    bins = range(int(min(open_ages or [0])), int(max(open_ages or [10])) + 2)
+    plt.hist(open_ages, bins=bins, color='#3498db', edgecolor='black', align='left')
+    plt.title(f'Open PR Age Distribution: {REPO_NAME}')
+    plt.xlabel('Days Since Created')
+    plt.ylabel('Amount of PRs')
+    plt.xticks(bins)
+    plt.grid(axis='y', linestyle='--', alpha=0.7)
+    plt.show()
+
+if __name__ == "__main__":
+    run_full_analysis()
